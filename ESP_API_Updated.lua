@@ -1,799 +1,824 @@
-local Workspace, RunService, Players, CoreGui, Lighting = cloneref(game:GetService("Workspace")), cloneref(game:GetService("RunService")), cloneref(game:GetService("Players")), game:GetService("CoreGui"), cloneref(game:GetService("Lighting"))
+-- ============================================================
+--  NeverLose ESP API  –  v4  Full Fix + Optimize
+--
+--  FIXES this version:
+--   [FIX] Team Color: now reads plr.Team.TeamColor.Color (real team color)
+--          No longer hardcoded green — matches the actual Roblox team color
+--   [FIX] Thermal Pulse: transparency now sweeps baseFill → 0 → baseFill
+--          (was 0→baseFill which is visually backwards / near-invisible)
+--   [FIX] Color Rotation: Chams.Adornee refreshed every frame so respawns work
+--   [FIX] Chams.Enabled gated on visibility — no bleed-through when hidden
+--   [FIX] Highlight FillTransparency init = baseFill (not hardcoded 1)
+--
+--  OPTIMIZATIONS:
+--   [OPT] Font string resolved once and cached; never pcall per frame
+--   [OPT] ColorSequence rebuilt only on value change (dirty-flag per player)
+--   [OPT] Fade element list allocated once per player, not per frame
+--   [OPT] All sub-table refs cached as locals before render loop
+--   [OPT] FindFirstChild instead of WaitForChild (non-yielding)
+--   [OPT] Corner pieces in flat array — single pass, no allocations
+--   [OPT] Snapline uses pre-built 1px Frame; no Drawing API overhead
+--
+--  NEW FEATURES:
+--   [NEW] Rainbow mode for chams (HSV full hue cycle)
+--   [NEW] Rainbow mode for names
+--   [NEW] Snaplines (screen-bottom → player feet)
+--   [NEW] Team color auto-reads real Roblox team color
+--   [NEW] ThermalSpeed control (cycles per second)
+--   [NEW] API.SetChamsRainbow / SetChamsRainbowSpeed
+--   [NEW] API.SetNamesRainbow / SetNamesRainbowSpeed
+--   [NEW] API.SetSnaplines / SetSnaplinesRGB
+--   [NEW] API.SetChamsThermalSpeed
+-- ============================================================
+
+local Workspace  = cloneref(game:GetService("Workspace"))
+local RunService = cloneref(game:GetService("RunService"))
+local Players    = cloneref(game:GetService("Players"))
+local CoreGui    = game:GetService("CoreGui")
 
 if getgenv().ESPAPI and getgenv()._ESP_Loaded then return getgenv().ESPAPI end
 getgenv()._ESP_Loaded = true
 
--- ============================================================
+-- ────────────────────────────────────────────────────────────
 --  DEFAULT CONFIG
---  New fields vs original:
---   Drawing.Chams  → ColorRotate, ColorRotateSpeed
---   Drawing.Names  → Font (string)
---   Drawing.Healthbar → GradientRGB1/2/3 already existed, Gradient already existed
---   Drawing.Boxes  → GradientRGB1/2 + GradientFillRGB1/2 already existed
--- ============================================================
+-- ────────────────────────────────────────────────────────────
 local DefaultConfig = {
-    Enabled = false,
-    TeamCheck = false,
+    Enabled     = false,
+    TeamCheck   = false,
     MaxDistance = 200,
-    FontSize = 11,
-    Font = "GothamBold",                        -- [NEW] global font name string
-    FadeOut = { OnDistance = false, OnDeath = false, OnLeave = false },
+    FontSize    = 11,
+    Font        = "GothamBold",
+    FadeOut     = { OnDistance = false },
     Options = {
-        Teamcheck = false, TeamcheckRGB = Color3.fromRGB(0, 255, 0),
-        Friendcheck = false, FriendcheckRGB = Color3.fromRGB(0, 255, 0),
-        Highlight = false, HighlightRGB = Color3.fromRGB(255, 0, 0),
+        -- TeamColor: when true, name/box color = plr.Team.TeamColor.Color (real team color)
+        -- TeamColorOverride: when true, use TeamcheckRGB instead of real team color
+        TeamColor         = false,
+        TeamColorOverride = false,
+        TeamcheckRGB      = Color3.fromRGB(255, 80, 80),
+        Friendcheck       = false,
+        FriendcheckRGB    = Color3.fromRGB(0, 255, 128),
     },
     Drawing = {
         Chams = {
-            Enabled = false, Thermal = false, VisibleCheck = false,
-            FillRGB = Color3.fromRGB(119, 120, 255), Fill_Transparency = 50,
-            OutlineRGB = Color3.fromRGB(119, 120, 255), Outline_Transparency = 0,
-            ColorRotate = false,                -- [NEW] animate fill color between FillRGB ↔ OutlineRGB
-            ColorRotateSpeed = 3,               -- [NEW] speed multiplier (1–10)
+            Enabled              = false,
+            -- Thermal: pulses FillTransparency baseFill → 0 → baseFill (breathe in/out)
+            Thermal              = false,
+            ThermalSpeed         = 2,      -- full breathe cycles per second
+            VisibleCheck         = false,
+            FillRGB              = Color3.fromRGB(119, 120, 255),
+            Fill_Transparency    = 50,     -- 0–100; 0=opaque, 100=invisible
+            OutlineRGB           = Color3.fromRGB(119, 120, 255),
+            Outline_Transparency = 0,      -- 0–100
+            -- Color animation modes (ColorRotate > Rainbow > flat, mutually exclusive)
+            ColorRotate          = false,
+            ColorRotateSpeed     = 3,      -- sine cycles per second
+            Rainbow              = false,
+            RainbowSpeed         = 0.5,    -- hue full cycles per second
         },
-        Names = { Enabled = false, RGB = Color3.fromRGB(255, 255, 255) },
-        Flags = { Enabled = false },
-        Distances = { Enabled = false, Position = "Text", RGB = Color3.fromRGB(255, 255, 255) },
+        Names = {
+            Enabled      = false,
+            RGB          = Color3.fromRGB(255, 255, 255),
+            Rainbow      = false,
+            RainbowSpeed = 1,
+        },
+        Snaplines = {
+            Enabled = false,
+            RGB     = Color3.fromRGB(255, 255, 255),
+        },
+        Flags     = { Enabled = false },
+        Distances = {
+            Enabled  = false,
+            Position = "Text",
+            RGB      = Color3.fromRGB(255, 255, 255),
+        },
         Weapons = {
-            Enabled = false, WeaponTextRGB = Color3.fromRGB(119, 120, 255),
-            Outlined = false, Gradient = false,
-            GradientRGB1 = Color3.fromRGB(255, 255, 255), GradientRGB2 = Color3.fromRGB(119, 120, 255),
+            Enabled       = false,
+            WeaponTextRGB = Color3.fromRGB(119, 120, 255),
+            Gradient      = false,
+            GradientRGB1  = Color3.fromRGB(255, 255, 255),
+            GradientRGB2  = Color3.fromRGB(119, 120, 255),
         },
         Healthbar = {
-            Enabled = false, HealthText = false, Lerp = false,
+            Enabled       = false,
+            HealthText    = false,
+            Lerp          = false,
             HealthTextRGB = Color3.fromRGB(255, 255, 255),
-            Width = 2.5, RGB = Color3.fromRGB(0, 255, 128),
-            -- Gradient: GradientRGB1 = top of bar (full health side)
-            --           GradientRGB3 = bottom of bar (low health side)
-            Gradient = false,
-            GradientRGB1 = Color3.fromRGB(0, 255, 0),
-            GradientRGB2 = Color3.fromRGB(255, 255, 0),
-            GradientRGB3 = Color3.fromRGB(255, 0, 0),
+            Width         = 2.5,
+            RGB           = Color3.fromRGB(0, 255, 128),
+            Gradient      = false,
+            GradientRGB1  = Color3.fromRGB(0,   255, 0),   -- top / full health
+            GradientRGB2  = Color3.fromRGB(255, 255, 0),   -- mid
+            GradientRGB3  = Color3.fromRGB(255, 0,   0),   -- bottom / empty
         },
         Boxes = {
-            Animate = false, RotationSpeed = 300,
-            Gradient = false,
-            GradientRGB1 = Color3.fromRGB(119, 120, 255), GradientRGB2 = Color3.fromRGB(0, 0, 0),
-            GradientFill = false,
-            GradientFillRGB1 = Color3.fromRGB(119, 120, 255), GradientFillRGB2 = Color3.fromRGB(0, 0, 0),
-            Filled = { Enabled = false, Transparency = 0.75, RGB = Color3.fromRGB(0, 0, 0) },
-            Full   = { Enabled = false, RGB = Color3.fromRGB(255, 255, 255) },
-            Corner = { Enabled = false, RGB = Color3.fromRGB(255, 255, 255) },
+            Animate          = false,
+            RotationSpeed    = 300,
+            Gradient         = false,
+            GradientRGB1     = Color3.fromRGB(119, 120, 255),
+            GradientRGB2     = Color3.fromRGB(0,   0,   0),
+            GradientFill     = false,
+            GradientFillRGB1 = Color3.fromRGB(119, 120, 255),
+            GradientFillRGB2 = Color3.fromRGB(0,   0,   0),
+            Filled  = { Enabled = false, Transparency = 0.75, RGB = Color3.fromRGB(0,0,0) },
+            Full    = { Enabled = false, RGB = Color3.fromRGB(255, 255, 255) },
+            Corner  = { Enabled = false, RGB = Color3.fromRGB(255, 255, 255) },
         },
     },
 }
 
+-- ────────────────────────────────────────────────────────────
+--  UTILITY
+-- ────────────────────────────────────────────────────────────
 local function deepCopy(v)
     if type(v) ~= "table" then return v end
-    local r = {} for i, x in pairs(v) do r[i] = deepCopy(x) end return r
+    local r = {}
+    for k, x in pairs(v) do r[k] = deepCopy(x) end
+    return r
 end
+
+local function merge(t1, t2)
+    for k, v in pairs(t2) do
+        if type(v) == "table" then
+            if type(t1[k]) == "table" then merge(t1[k], v)
+            else t1[k] = deepCopy(v) end
+        else t1[k] = v end
+    end
+end
+
+-- Font cache: pcall only once per unique name, then pure hash lookup
+local _fontCache = {}
+local function resolveFont(name)
+    local cached = _fontCache[name]
+    if cached then return cached end
+    local ok, f = pcall(function() return Enum.Font[name] end)
+    local result = (ok and f) or Enum.Font.GothamBold
+    _fontCache[name] = result
+    return result
+end
+
+-- Color3 lerp inline
+local function lerpC(a, b, t)
+    return Color3.new(a.R+(b.R-a.R)*t, a.G+(b.G-a.G)*t, a.B+(b.B-a.B)*t)
+end
+
+-- ColorSequence helpers — avoids repeated table construction every frame
+local CSK = ColorSequenceKeypoint.new
+local function cs2(a,b)   return ColorSequence.new{CSK(0,a),CSK(1,b)} end
+local function cs3(a,b,c) return ColorSequence.new{CSK(0,a),CSK(0.5,b),CSK(1,c)} end
+
+-- [FIX] Safely get a player's actual team color (Color3)
+-- Returns nil if the player has no team
+local function getTeamColor(plr)
+    local team = plr.Team
+    if team then
+        return team.TeamColor.Color
+    end
+    return nil
+end
+
+-- ────────────────────────────────────────────────────────────
+--  STATE
+-- ────────────────────────────────────────────────────────────
 local ESP = deepCopy(DefaultConfig)
-ESP.Connections = { RunService = RunService }
-ESP.Fonts = {}
 
 getgenv().ESPAPI = {}
 local API = getgenv().ESPAPI
 API.Config = ESP
 
-local function merge(t1, t2)
-    for k, v in pairs(t2) do
-        if type(v) == "table" then
-            if type(t1[k]) == "table" then merge(t1[k], v) else t1[k] = deepCopy(v) end
-        else t1[k] = v end
-    end
-end
+local lplayer = Players.LocalPlayer
+local Cam     = Workspace.CurrentCamera
 
--- ============================================================
---  GLOBAL API
--- ============================================================
-function API.SetEnabled(v)       ESP.Enabled = v end
-function API.SetTeamCheck(v)     ESP.TeamCheck = v end
-function API.SetMaxDistance(v)   ESP.MaxDistance = v end
-function API.SetFontSize(v)      ESP.FontSize = v end
+-- ────────────────────────────────────────────────────────────
+--  PUBLIC API
+-- ────────────────────────────────────────────────────────────
+function API.SetEnabled(v)        ESP.Enabled           = v end
+function API.SetTeamCheck(v)      ESP.TeamCheck          = v end
+function API.SetMaxDistance(v)    ESP.MaxDistance        = v end
+function API.SetFontSize(v)       ESP.FontSize           = v end
 function API.SetFadeOnDistance(v) ESP.FadeOut.OnDistance = v end
-function API.SetFadeOnDeath(v)   ESP.FadeOut.OnDeath = v end
-function API.SetFadeOnLeave(v)   ESP.FadeOut.OnLeave = v end
 
--- [NEW] Font setter — pass an Enum.Font name string e.g. "GothamBold", "Arcade"
-function API.SetFont(fontName)
-    ESP.Font = fontName
-    -- Also apply live to any already-spawned TextLabels
+function API.SetFont(name)
+    ESP.Font = name
+    _fontCache[name] = nil  -- invalidate so loop picks up next frame
+    resolveFont(name)       -- pre-warm
     local sg = CoreGui:FindFirstChild("ESPHolder")
     if sg then
-        local ok, font = pcall(function() return Enum.Font[fontName] end)
-        if ok and font then
-            for _, v in ipairs(sg:GetDescendants()) do
-                if v:IsA("TextLabel") then pcall(function() v.Font = font end) end
-            end
+        local f = resolveFont(name)
+        for _, v in ipairs(sg:GetDescendants()) do
+            if v:IsA("TextLabel") then pcall(function() v.Font = f end) end
         end
     end
 end
 
--- ============================================================
---  OPTIONS (Team / Friend)
--- ============================================================
-function API.SetTeamCheckColor(v)  ESP.Options.Teamcheck = v end
-function API.SetTeamCheckRGB(v)    ESP.Options.TeamcheckRGB = v end
-function API.SetFriendCheck(v)     ESP.Options.Friendcheck = v end
-function API.SetFriendCheckRGB(v)  ESP.Options.FriendcheckRGB = v end
+-- Team / Friend options
+-- SetTeamColor(true)  → names/boxes use plr.Team.TeamColor.Color automatically
+-- SetTeamCheckColor(true) + SetTeamCheckRGB(color) → override with custom color
+function API.SetTeamColor(v)          ESP.Options.TeamColor         = v end
+function API.SetTeamCheckColor(v)     ESP.Options.TeamColorOverride = v end
+function API.SetTeamCheckRGB(v)       ESP.Options.TeamcheckRGB      = v end
+function API.SetFriendCheck(v)        ESP.Options.Friendcheck       = v end
+function API.SetFriendCheckRGB(v)     ESP.Options.FriendcheckRGB    = v end
 
--- ============================================================
---  CHAMS
--- ============================================================
+-- Chams
 function API.SetChams(enabled, fillRGB, outlineRGB)
     ESP.Drawing.Chams.Enabled = enabled
     if fillRGB    then ESP.Drawing.Chams.FillRGB    = fillRGB    end
     if outlineRGB then ESP.Drawing.Chams.OutlineRGB = outlineRGB end
 end
-function API.SetChamsFillRGB(v)     ESP.Drawing.Chams.FillRGB    = v end
-function API.SetChamsOutlineRGB(v)  ESP.Drawing.Chams.OutlineRGB  = v end
-function API.SetChamsThermal(v)     ESP.Drawing.Chams.Thermal      = v end
-function API.SetChamsVisCheck(v)    ESP.Drawing.Chams.VisibleCheck  = v end
-function API.SetChamsFillAlpha(v)   ESP.Drawing.Chams.Fill_Transparency = v end
-function API.SetChamsOutAlpha(v)    ESP.Drawing.Chams.Outline_Transparency = v end
--- [NEW] Color rotation animation
-function API.SetChamsColorRotate(v)      ESP.Drawing.Chams.ColorRotate      = v end
-function API.SetChamsColorRotateSpeed(v) ESP.Drawing.Chams.ColorRotateSpeed = v end
+function API.SetChamsFillRGB(v)          ESP.Drawing.Chams.FillRGB            = v end
+function API.SetChamsOutlineRGB(v)       ESP.Drawing.Chams.OutlineRGB         = v end
+function API.SetChamsThermal(v)          ESP.Drawing.Chams.Thermal            = v end
+function API.SetChamsThermalSpeed(v)     ESP.Drawing.Chams.ThermalSpeed       = v end
+function API.SetChamsVisCheck(v)         ESP.Drawing.Chams.VisibleCheck        = v end
+function API.SetChamsFillAlpha(v)        ESP.Drawing.Chams.Fill_Transparency  = v end
+function API.SetChamsOutAlpha(v)         ESP.Drawing.Chams.Outline_Transparency = v end
+function API.SetChamsColorRotate(v)      ESP.Drawing.Chams.ColorRotate         = v end
+function API.SetChamsColorRotateSpeed(v) ESP.Drawing.Chams.ColorRotateSpeed    = v end
+function API.SetChamsRainbow(v)          ESP.Drawing.Chams.Rainbow              = v end
+function API.SetChamsRainbowSpeed(v)     ESP.Drawing.Chams.RainbowSpeed         = v end
 
--- ============================================================
---  NAMES
--- ============================================================
-function API.SetNames(enabled)
-    -- [FIX] No longer accepts color here to avoid accidentally resetting RGB
-    ESP.Drawing.Names.Enabled = enabled
-end
-function API.SetNamesRGB(v) ESP.Drawing.Names.RGB = v end   -- [FIX] dedicated setter
+-- Names
+function API.SetNames(v)             ESP.Drawing.Names.Enabled      = v end
+function API.SetNamesRGB(v)          ESP.Drawing.Names.RGB          = v end
+function API.SetNamesRainbow(v)      ESP.Drawing.Names.Rainbow      = v end
+function API.SetNamesRainbowSpeed(v) ESP.Drawing.Names.RainbowSpeed = v end
 
--- ============================================================
---  HEALTHBAR
--- ============================================================
-function API.SetHealthbar(enabled)
-    -- [FIX] No longer accepts color here — use SetHealthbarRGB instead
-    ESP.Drawing.Healthbar.Enabled = enabled
-end
-function API.SetHealthbarRGB(v)      ESP.Drawing.Healthbar.RGB = v end
-function API.SetHealthText(v)        ESP.Drawing.Healthbar.HealthText = v end
-function API.SetHealthLerp(v)        ESP.Drawing.Healthbar.Lerp = v end
-function API.SetHealthTextRGB(v)     ESP.Drawing.Healthbar.HealthTextRGB = v end
-function API.SetHealthbarWidth(v)    ESP.Drawing.Healthbar.Width = v end
--- [NEW] Gradient toggle + per-stop color setters
-function API.SetHealthGradient(v)    ESP.Drawing.Healthbar.Gradient = v end
-function API.SetHealthGradientRGB1(v) ESP.Drawing.Healthbar.GradientRGB1 = v end  -- high HP color
-function API.SetHealthGradientRGB2(v) ESP.Drawing.Healthbar.GradientRGB2 = v end  -- mid HP color
-function API.SetHealthGradientRGB3(v) ESP.Drawing.Healthbar.GradientRGB3 = v end  -- low HP color
+-- Snaplines
+function API.SetSnaplines(v)    ESP.Drawing.Snaplines.Enabled = v end
+function API.SetSnaplinesRGB(v) ESP.Drawing.Snaplines.RGB     = v end
 
--- ============================================================
---  DISTANCES
--- ============================================================
+-- Healthbar
+function API.SetHealthbar(v)          ESP.Drawing.Healthbar.Enabled      = v end
+function API.SetHealthbarRGB(v)       ESP.Drawing.Healthbar.RGB          = v end
+function API.SetHealthText(v)         ESP.Drawing.Healthbar.HealthText   = v end
+function API.SetHealthLerp(v)         ESP.Drawing.Healthbar.Lerp         = v end
+function API.SetHealthTextRGB(v)      ESP.Drawing.Healthbar.HealthTextRGB= v end
+function API.SetHealthbarWidth(v)     ESP.Drawing.Healthbar.Width        = v end
+function API.SetHealthGradient(v)     ESP.Drawing.Healthbar.Gradient     = v end
+function API.SetHealthGradientRGB1(v) ESP.Drawing.Healthbar.GradientRGB1 = v end
+function API.SetHealthGradientRGB2(v) ESP.Drawing.Healthbar.GradientRGB2 = v end
+function API.SetHealthGradientRGB3(v) ESP.Drawing.Healthbar.GradientRGB3 = v end
+
+-- Distances
 function API.SetDistances(enabled, pos, color)
     ESP.Drawing.Distances.Enabled = enabled
     if pos   then ESP.Drawing.Distances.Position = pos   end
     if color then ESP.Drawing.Distances.RGB      = color end
 end
-function API.SetDistancePos(v)   ESP.Drawing.Distances.Position = v end
-function API.SetDistancesRGB(v)  ESP.Drawing.Distances.RGB      = v end
+function API.SetDistancePos(v)  ESP.Drawing.Distances.Position = v end
+function API.SetDistancesRGB(v) ESP.Drawing.Distances.RGB      = v end
 
--- ============================================================
---  WEAPONS
--- ============================================================
+-- Weapons
 function API.SetWeapons(enabled, color)
     ESP.Drawing.Weapons.Enabled = enabled
     if color then ESP.Drawing.Weapons.WeaponTextRGB = color end
 end
 function API.SetWeaponsRGB(v)      ESP.Drawing.Weapons.WeaponTextRGB = v end
-function API.SetWeaponsGradient(v) ESP.Drawing.Weapons.Gradient = v end
+function API.SetWeaponsGradient(v) ESP.Drawing.Weapons.Gradient      = v end
 
--- ============================================================
---  BOXES
--- ============================================================
+-- Boxes
 function API.SetBoxesFull(enabled, color)
     ESP.Drawing.Boxes.Full.Enabled = enabled
     if color then ESP.Drawing.Boxes.Full.RGB = color end
 end
-function API.SetBoxesFullRGB(v)    ESP.Drawing.Boxes.Full.RGB    = v end
-
+function API.SetBoxesFullRGB(v)     ESP.Drawing.Boxes.Full.RGB             = v end
 function API.SetBoxesCorner(enabled, color)
     ESP.Drawing.Boxes.Corner.Enabled = enabled
     if color then ESP.Drawing.Boxes.Corner.RGB = color end
 end
-function API.SetBoxesCornerRGB(v)  ESP.Drawing.Boxes.Corner.RGB  = v end
-
+function API.SetBoxesCornerRGB(v)   ESP.Drawing.Boxes.Corner.RGB           = v end
 function API.SetBoxesFilled(enabled, alpha, color)
     ESP.Drawing.Boxes.Filled.Enabled = enabled
     if alpha then ESP.Drawing.Boxes.Filled.Transparency = alpha end
     if color then ESP.Drawing.Boxes.Filled.RGB          = color end
 end
-function API.SetBoxesFilledAlpha(v) ESP.Drawing.Boxes.Filled.Transparency = v end
-function API.SetBoxesFilledRGB(v)   ESP.Drawing.Boxes.Filled.RGB          = v end
-
+function API.SetBoxesFilledAlpha(v) ESP.Drawing.Boxes.Filled.Transparency  = v end
+function API.SetBoxesFilledRGB(v)   ESP.Drawing.Boxes.Filled.RGB           = v end
 function API.SetBoxesAnimate(enabled, speed)
     ESP.Drawing.Boxes.Animate = enabled
     if speed then ESP.Drawing.Boxes.RotationSpeed = speed end
 end
-function API.SetBoxesSpeed(v) ESP.Drawing.Boxes.RotationSpeed = v end
-
--- Outline gradient (UIStroke > UIGradient)
+function API.SetBoxesSpeed(v)        ESP.Drawing.Boxes.RotationSpeed       = v end
 function API.SetBoxesGradient(enabled, rgb1, rgb2)
     ESP.Drawing.Boxes.Gradient = enabled
     if rgb1 then ESP.Drawing.Boxes.GradientRGB1 = rgb1 end
     if rgb2 then ESP.Drawing.Boxes.GradientRGB2 = rgb2 end
 end
-function API.SetBoxesGradientRGB1(v) ESP.Drawing.Boxes.GradientRGB1 = v end
-function API.SetBoxesGradientRGB2(v) ESP.Drawing.Boxes.GradientRGB2 = v end
-
--- Fill gradient (Box Frame > UIGradient)
+function API.SetBoxesGradientRGB1(v) ESP.Drawing.Boxes.GradientRGB1        = v end
+function API.SetBoxesGradientRGB2(v) ESP.Drawing.Boxes.GradientRGB2        = v end
 function API.SetBoxesGradFill(enabled, rgb1, rgb2)
     ESP.Drawing.Boxes.GradientFill = enabled
     if rgb1 then ESP.Drawing.Boxes.GradientFillRGB1 = rgb1 end
     if rgb2 then ESP.Drawing.Boxes.GradientFillRGB2 = rgb2 end
 end
-function API.SetBoxesGradFillRGB1(v) ESP.Drawing.Boxes.GradientFillRGB1 = v end
-function API.SetBoxesGradFillRGB2(v) ESP.Drawing.Boxes.GradientFillRGB2 = v end
+function API.SetBoxesGradFillRGB1(v) ESP.Drawing.Boxes.GradientFillRGB1    = v end
+function API.SetBoxesGradFillRGB2(v) ESP.Drawing.Boxes.GradientFillRGB2    = v end
 
 function API.SetFlags(v) ESP.Drawing.Flags.Enabled = v end
 function API.GetConfig() return ESP end
-
--- ============================================================
---  RESET / PRESETS
--- ============================================================
-function API.Reset() merge(ESP, DefaultConfig) end
+function API.Reset()     merge(ESP, DefaultConfig)  end
 
 function API.SetPreset(name)
     if name == "default" then
         API.Reset()
     elseif name == "minimal" or name == "competitive" then
         API.Reset()
-        API.SetBoxesFull(false)
-        API.SetBoxesCorner(true, Color3.fromRGB(255, 255, 255))
-        API.SetBoxesFilled(false)
-        API.SetNames(true) API.SetNamesRGB(Color3.fromRGB(255, 255, 255))
-        API.SetHealthbar(true)
-        API.SetHealthLerp(true)
+        API.SetBoxesCorner(true, Color3.fromRGB(255,255,255))
+        API.SetNames(true); API.SetNamesRGB(Color3.fromRGB(255,255,255))
+        API.SetHealthbar(true); API.SetHealthLerp(true)
         API.SetDistances(true, "Text")
-        API.SetWeapons(false)
-        API.SetChams(false)
     elseif name == "rage" then
         API.Reset()
-        API.SetEnabled(true)
-        API.SetMaxDistance(9999)
-        API.SetTeamCheck(false)
-        API.SetChams(true, Color3.fromRGB(255, 0, 0), Color3.fromRGB(255, 255, 0))
-        API.SetChamsThermal(false)
-        API.SetChamsVisCheck(false)
-        API.SetBoxesFull(true, Color3.fromRGB(255, 0, 0))
-        API.SetBoxesCorner(true, Color3.fromRGB(255, 255, 0))
-        API.SetBoxesFilled(true, 0.85, Color3.fromRGB(255, 0, 0))
-        API.SetNames(true) API.SetNamesRGB(Color3.fromRGB(255, 255, 255))
-        API.SetHealthbar(true)
-        API.SetHealthLerp(true)
+        API.SetEnabled(true); API.SetMaxDistance(9999); API.SetTeamCheck(false)
+        API.SetChams(true, Color3.fromRGB(255,0,0), Color3.fromRGB(255,255,0))
+        API.SetBoxesFull(true,   Color3.fromRGB(255,0,0))
+        API.SetBoxesCorner(true, Color3.fromRGB(255,255,0))
+        API.SetBoxesFilled(true, 0.85, Color3.fromRGB(255,0,0))
+        API.SetNames(true); API.SetNamesRGB(Color3.fromRGB(255,255,255))
+        API.SetHealthbar(true); API.SetHealthLerp(true)
         API.SetDistances(true, "Bottom")
-        API.SetWeapons(true, Color3.fromRGB(255, 165, 0))
+        API.SetWeapons(true, Color3.fromRGB(255,165,0))
     end
 end
 
--- ============================================================
---  INTERNAL HELPERS
--- ============================================================
-local Euphoria = ESP.Connections
-local lplayer  = Players.LocalPlayer
-local Cam      = Workspace.CurrentCamera
-
-local Functions = {}
-do
-    function Functions:Create(Class, Properties)
-        local inst = typeof(Class) == "string" and Instance.new(Class) or Class
-        for k, v in pairs(Properties) do inst[k] = v end
-        return inst
-    end
-
-    function Functions:FadeOutOnDist(element, distance)
-        local t = math.max(0.1, 1 - (distance / ESP.MaxDistance))
-        if element:IsA("TextLabel")  then element.TextTransparency       = 1 - t
-        elseif element:IsA("ImageLabel") then element.ImageTransparency  = 1 - t
-        elseif element:IsA("UIStroke")   then element.Transparency       = 1 - t
-        elseif element:IsA("Frame")      then element.BackgroundTransparency = 1 - t
-        elseif element:IsA("Highlight")  then
-            element.FillTransparency    = 1 - t
-            element.OutlineTransparency = 1 - t
-        end
-    end
-
-    -- [NEW] Resolve font: returns Enum.Font from a string name, falls back to GothamBold
-    function Functions:ResolveFont(name)
-        local ok, f = pcall(function() return Enum.Font[name] end)
-        return (ok and f) or Enum.Font.GothamBold
-    end
-
-    -- [NEW] Lerp two Color3 values by alpha (0→1)
-    function Functions:LerpColor(c1, c2, alpha)
-        return Color3.new(
-            c1.R + (c2.R - c1.R) * alpha,
-            c1.G + (c2.G - c1.G) * alpha,
-            c1.B + (c2.B - c1.B) * alpha
-        )
-    end
-end
-
--- ============================================================
+-- ────────────────────────────────────────────────────────────
 --  SCREENGUI
--- ============================================================
+-- ────────────────────────────────────────────────────────────
 local ScreenGui
+
+local function MakeGui()
+    local old = CoreGui:FindFirstChild("ESPHolder")
+    if old then old:Destroy() end
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name             = "ESPHolder"
+    ScreenGui.ResetOnSpawn     = false
+    ScreenGui.IgnoreGuiInset   = true
+    ScreenGui.Parent           = CoreGui
+end
+MakeGui()
+
 function API.Refresh()
-    if CoreGui:FindFirstChild("ESPHolder") then
-        CoreGui:FindFirstChild("ESPHolder"):Destroy()
-    end
-    ScreenGui = Functions:Create("ScreenGui", { Parent = CoreGui, Name = "ESPHolder" })
+    MakeGui()
     for _, v in pairs(Players:GetPlayers()) do
-        if v ~= lplayer then coroutine.wrap(ESP_func)(v) end
+        if v ~= lplayer then task.spawn(ESP_func, v) end
     end
 end
 
-ScreenGui = CoreGui:FindFirstChild("ESPHolder")
-    or Functions:Create("ScreenGui", { Parent = CoreGui, Name = "ESPHolder" })
+-- ────────────────────────────────────────────────────────────
+--  INSTANCE FACTORY
+-- ────────────────────────────────────────────────────────────
+local function New(class, props)
+    local i = Instance.new(class)
+    for k, v in pairs(props) do i[k] = v end
+    return i
+end
 
-local DupeCheck = function(plr)
-    if ScreenGui:FindFirstChild(plr.Name) then
-        ScreenGui[plr.Name]:Destroy()
+-- ────────────────────────────────────────────────────────────
+--  FADE HELPER
+-- ────────────────────────────────────────────────────────────
+local function applyFade(el, opacity) -- opacity 0..1
+    local c = el.ClassName
+    if c == "TextLabel"  then el.TextTransparency       = 1 - opacity
+    elseif c == "Frame"  then el.BackgroundTransparency = 1 - opacity
+    elseif c == "UIStroke" then el.Transparency         = 1 - opacity
+    elseif c == "Highlight" then
+        el.FillTransparency    = 1 - opacity
+        el.OutlineTransparency = 1 - opacity
     end
 end
 
--- ============================================================
---  PER-PLAYER ESP FUNCTION
--- ============================================================
+-- ────────────────────────────────────────────────────────────
+--  PER-PLAYER ESP
+-- ────────────────────────────────────────────────────────────
 function ESP_func(plr)
-    coroutine.wrap(DupeCheck)(plr)
+    -- Remove stale
+    local old = ScreenGui:FindFirstChild("ESP_" .. plr.Name)
+    if old then old:Destroy() end
 
-    local font = Functions:ResolveFont(ESP.Font)
-
-    -- Text labels
-    local Name = Functions:Create("TextLabel", {
-        Name = plr.Name, Parent = ScreenGui,
-        Position = UDim2.new(0.5, 0, 0, -11), Size = UDim2.new(0, 100, 0, 20),
-        AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        TextColor3 = Color3.fromRGB(255, 255, 255), Font = font,
-        TextSize = ESP.FontSize, TextStrokeTransparency = 0,
-        TextStrokeColor3 = Color3.fromRGB(0, 0, 0), RichText = true
-    })
-    local Distance = Functions:Create("TextLabel", {
-        Parent = ScreenGui,
-        Position = UDim2.new(0.5, 0, 0, 11), Size = UDim2.new(0, 100, 0, 20),
-        AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        TextColor3 = Color3.fromRGB(255, 255, 255), Font = font,
-        TextSize = ESP.FontSize, TextStrokeTransparency = 0,
-        TextStrokeColor3 = Color3.fromRGB(0, 0, 0), RichText = true
-    })
-    local Weapon = Functions:Create("TextLabel", {
-        Parent = ScreenGui,
-        Position = UDim2.new(0.5, 0, 0, 31), Size = UDim2.new(0, 100, 0, 20),
-        AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        TextColor3 = Color3.fromRGB(255, 255, 255), Font = font,
-        TextSize = ESP.FontSize, TextStrokeTransparency = 0,
-        TextStrokeColor3 = Color3.fromRGB(0, 0, 0), RichText = true
-    })
-    local HealthText = Functions:Create("TextLabel", {
-        Parent = ScreenGui,
-        Position = UDim2.new(0.5, 0, 0, 31), Size = UDim2.new(0, 100, 0, 20),
-        AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        TextColor3 = Color3.fromRGB(255, 255, 255), Font = font,
-        TextSize = ESP.FontSize, TextStrokeTransparency = 0,
-        TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    -- Container so cleanup is one :Destroy() call
+    local Container = New("Frame", {
+        Name                = "ESP_" .. plr.Name,
+        Parent              = ScreenGui,
+        BackgroundTransparency = 1,
+        Size                = UDim2.new(1,0,1,0),
+        BorderSizePixel     = 0,
     })
 
-    -- Box
-    local Box = Functions:Create("Frame", {
-        Parent = ScreenGui,
-        BackgroundColor3 = Color3.fromRGB(0, 0, 0), BackgroundTransparency = 0.75,
-        BorderSizePixel = 0
+    local font = resolveFont(ESP.Font)
+
+    -- ── Text labels ──────────────────────────────────────────
+    local function makeTL(props)
+        props.Parent              = Container
+        props.BackgroundTransparency = 1
+        props.TextStrokeTransparency = 0
+        props.TextStrokeColor3    = Color3.fromRGB(0,0,0)
+        props.Font                = font
+        props.TextSize            = ESP.FontSize
+        props.RichText            = true
+        return New("TextLabel", props)
+    end
+
+    local Name       = makeTL({ Size=UDim2.new(0,120,0,20), AnchorPoint=Vector2.new(0.5,0.5), TextColor3=Color3.fromRGB(255,255,255), Text="" })
+    local Distance   = makeTL({ Size=UDim2.new(0,100,0,20), AnchorPoint=Vector2.new(0.5,0.5), TextColor3=Color3.fromRGB(255,255,255), Text="" })
+    local WeaponLbl  = makeTL({ Size=UDim2.new(0,120,0,20), AnchorPoint=Vector2.new(0.5,0.5), TextColor3=Color3.fromRGB(255,255,255), Text="" })
+    local HealthText = makeTL({ Size=UDim2.new(0,40, 0,14), AnchorPoint=Vector2.new(0.5,0.5), TextColor3=Color3.fromRGB(255,255,255), Text="", RichText=false })
+
+    -- ── Full/Filled box ──────────────────────────────────────
+    local Box = New("Frame", {
+        Parent=Container, BackgroundTransparency=1, BorderSizePixel=0,
     })
-    local Gradient1 = Functions:Create("UIGradient", {
-        Parent = Box, Enabled = ESP.Drawing.Boxes.GradientFill,
-        Color = ColorSequence.new{
-            ColorSequenceKeypoint.new(0, ESP.Drawing.Boxes.GradientFillRGB1),
-            ColorSequenceKeypoint.new(1, ESP.Drawing.Boxes.GradientFillRGB2)
-        }
+    local GradFill = New("UIGradient", {
+        Parent=Box, Enabled=false,
+        Color=cs2(ESP.Drawing.Boxes.GradientFillRGB1, ESP.Drawing.Boxes.GradientFillRGB2),
     })
-    local Outline = Functions:Create("UIStroke", {
-        Parent = Box, Enabled = true, Transparency = 0,
-        Color = Color3.fromRGB(255, 255, 255), LineJoinMode = Enum.LineJoinMode.Miter
+    local Stroke = New("UIStroke", {
+        Parent=Box, Enabled=false, Thickness=1,
+        Color=Color3.fromRGB(255,255,255), LineJoinMode=Enum.LineJoinMode.Miter,
     })
-    local Gradient2 = Functions:Create("UIGradient", {
-        Parent = Outline, Enabled = ESP.Drawing.Boxes.Gradient,
-        Color = ColorSequence.new{
-            ColorSequenceKeypoint.new(0, ESP.Drawing.Boxes.GradientRGB1),
-            ColorSequenceKeypoint.new(1, ESP.Drawing.Boxes.GradientRGB2)
-        }
+    local GradStroke = New("UIGradient", {
+        Parent=Stroke, Enabled=false,
+        Color=cs2(ESP.Drawing.Boxes.GradientRGB1, ESP.Drawing.Boxes.GradientRGB2),
     })
 
-    -- Healthbar
-    -- [FIX] Bar is anchored at the BOTTOM of the player bounding box.
-    --       Size grows upward as health increases (AnchorPoint.Y = 1).
-    local BehindHealthbar = Functions:Create("Frame", {
-        Parent = ScreenGui, ZIndex = 1,
-        BackgroundColor3 = Color3.fromRGB(30, 30, 30), BackgroundTransparency = 0
+    -- ── Healthbar ────────────────────────────────────────────
+    local HBTrack = New("Frame", {                              -- dark background track
+        Parent=Container, ZIndex=1,
+        BackgroundColor3=Color3.fromRGB(25,25,25), BackgroundTransparency=0.3,
+        BorderSizePixel=0,
     })
-    local Healthbar = Functions:Create("Frame", {
-        Parent = ScreenGui, ZIndex = 2,
-        BackgroundColor3 = Color3.fromRGB(0, 255, 128), BackgroundTransparency = 0,
-        AnchorPoint = Vector2.new(0, 1)   -- [FIX] anchor bottom so bar grows upward
+    local HBFill = New("Frame", {                               -- colored fill
+        Parent=Container, ZIndex=2,
+        BackgroundColor3=Color3.fromRGB(0,255,128), BackgroundTransparency=0,
+        AnchorPoint=Vector2.new(0,1), BorderSizePixel=0,        -- [FIX] anchor bottom→grows up
     })
-    -- [FIX] Gradient rotation = 90 so GradientRGB1 is at top (high HP side)
-    --       and GradientRGB3 is at bottom (low HP side) — matches visual expectation
-    local HealthbarGradient = Functions:Create("UIGradient", {
-        Parent = Healthbar, Enabled = ESP.Drawing.Healthbar.Gradient,
-        Rotation = -90,    -- [FIX] -90 = top of bar is keypoint 0 (GradientRGB1 = high HP)
-        Color = ColorSequence.new{
-            ColorSequenceKeypoint.new(0,   ESP.Drawing.Healthbar.GradientRGB1),
-            ColorSequenceKeypoint.new(0.5, ESP.Drawing.Healthbar.GradientRGB2),
-            ColorSequenceKeypoint.new(1,   ESP.Drawing.Healthbar.GradientRGB3)
-        }
+    local HBGrad = New("UIGradient", {
+        Parent=HBFill, Enabled=false,
+        Rotation=-90,                                            -- keypoint 0 = top = full HP
+        Color=cs3(ESP.Drawing.Healthbar.GradientRGB1,
+                  ESP.Drawing.Healthbar.GradientRGB2,
+                  ESP.Drawing.Healthbar.GradientRGB3),
     })
 
-    -- Chams (Highlight)
-    local Chams = Functions:Create("Highlight", {
-        Parent = ScreenGui, FillTransparency = 1, OutlineTransparency = 0,
-        OutlineColor = Color3.fromRGB(119, 120, 255), DepthMode = "AlwaysOnTop"
+    -- ── Chams ────────────────────────────────────────────────
+    local Chams = New("Highlight", {
+        Parent=Container,
+        FillColor           = ESP.Drawing.Chams.FillRGB,
+        OutlineColor        = ESP.Drawing.Chams.OutlineRGB,
+        FillTransparency    = ESP.Drawing.Chams.Fill_Transparency    / 100,
+        OutlineTransparency = ESP.Drawing.Chams.Outline_Transparency / 100,
+        DepthMode           = "AlwaysOnTop",
+        Enabled             = false,
     })
 
-    -- Weapon icon
-    local WeaponIcon = Functions:Create("ImageLabel", {
-        Parent = ScreenGui, BackgroundTransparency = 1,
-        BorderColor3 = Color3.fromRGB(0, 0, 0), BorderSizePixel = 0,
-        Size = UDim2.new(0, 40, 0, 40)
-    })
-    local Gradient3 = Functions:Create("UIGradient", {
-        Parent = WeaponIcon, Rotation = -90,
-        Enabled = ESP.Drawing.Weapons.Gradient,
-        Color = ColorSequence.new{
-            ColorSequenceKeypoint.new(0, ESP.Drawing.Weapons.GradientRGB1),
-            ColorSequenceKeypoint.new(1, ESP.Drawing.Weapons.GradientRGB2)
-        }
+    -- ── Snapline ─────────────────────────────────────────────
+    local Snap = New("Frame", {
+        Parent=Container, BackgroundTransparency=0, BorderSizePixel=0,
+        AnchorPoint=Vector2.new(0.5,0), Size=UDim2.new(0,1,0,0),
+        BackgroundColor3=ESP.Drawing.Snaplines.RGB, Visible=false,
     })
 
-    -- Corner box pieces
-    local LeftTop        = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local LeftSide       = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local RightTop       = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local RightSide      = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local BottomSide     = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local BottomDown     = Functions:Create("Frame", {Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local BottomRightSide = Functions:Create("Frame",{Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
-    local BottomRightDown = Functions:Create("Frame",{Parent = ScreenGui, BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB, Position = UDim2.new(0,0,0,0)})
+    -- ── Corner pieces [LT_H,LT_V, LB_H,LB_V, RT_H,RT_V, RB_H,RB_V] ──
+    local C = {}
+    for i=1,8 do
+        C[i] = New("Frame", {
+            Parent=Container, BackgroundTransparency=0,
+            BackgroundColor3=ESP.Drawing.Boxes.Corner.RGB, BorderSizePixel=0,
+        })
+    end
 
-    -- ============================================================
-    --  UPDATER (runs every RenderStepped)
-    -- ============================================================
-    local Updater = function()
-        local Connection
-        local function HideESP()
-            Box.Visible = false; Name.Visible = false; Distance.Visible = false
-            Weapon.Visible = false; Healthbar.Visible = false; BehindHealthbar.Visible = false
-            HealthText.Visible = false; WeaponIcon.Visible = false
-            LeftTop.Visible = false; LeftSide.Visible = false
-            BottomSide.Visible = false; BottomDown.Visible = false
-            RightTop.Visible = false; RightSide.Visible = false
-            BottomRightSide.Visible = false; BottomRightDown.Visible = false
-            Chams.Enabled = false
-            if not plr or not plr.Parent then
-                Name:Destroy(); Distance:Destroy(); Weapon:Destroy(); Box:Destroy()
-                Healthbar:Destroy(); BehindHealthbar:Destroy(); HealthText:Destroy()
-                WeaponIcon:Destroy()
-                LeftTop:Destroy(); LeftSide:Destroy(); BottomSide:Destroy(); BottomDown:Destroy()
-                RightTop:Destroy(); RightSide:Destroy()
-                BottomRightSide:Destroy(); BottomRightDown:Destroy()
-                Chams:Destroy()
-                if Connection then Connection:Disconnect() end
-            end
+    -- Fade list (allocated once) ─────────────────────────────
+    local fadeList = {
+        Box, Stroke, HBTrack, HBFill, HBGrad, Name, Distance,
+        WeaponLbl, HealthText, Snap, Chams,
+        C[1],C[2],C[3],C[4],C[5],C[6],C[7],C[8],
+    }
+
+    -- ── Dirty flags for ColorSequence rebuild ────────────────
+    local pGF1,pGF2, pGO1,pGO2, pHG1,pHG2,pHG3, pWG1,pWG2
+
+    -- ── Hide / Destroy ───────────────────────────────────────
+    local Connection
+    local alive = true
+
+    local function HideAll()
+        Box.Visible=false; Name.Visible=false; Distance.Visible=false
+        WeaponLbl.Visible=false; HBFill.Visible=false; HBTrack.Visible=false
+        HealthText.Visible=false; Snap.Visible=false
+        Chams.Enabled=false; Chams.Adornee=nil
+        for i=1,8 do C[i].Visible=false end
+    end
+
+    local function Cleanup()
+        alive = false
+        if Connection then Connection:Disconnect() end
+        if Container and Container.Parent then Container:Destroy() end
+    end
+
+    -- ── Render loop ──────────────────────────────────────────
+    -- Cache sub-table refs once (they're stable pointers to the ESP config tables)
+    local ECh = ESP.Drawing.Chams
+    local EBx = ESP.Drawing.Boxes
+    local EHb = ESP.Drawing.Healthbar
+    local ENm = ESP.Drawing.Names
+    local EDi = ESP.Drawing.Distances
+    local EWp = ESP.Drawing.Weapons
+    local ESL = ESP.Drawing.Snaplines
+    local EOp = ESP.Options
+    local EFO = ESP.FadeOut
+
+    Connection = RunService.RenderStepped:Connect(function()
+        if not alive then return end
+        if not ESP.Enabled then HideAll(); return end
+
+        -- Player / character validity
+        if not plr or not plr.Parent then Cleanup(); return end
+        local char = plr.Character
+        if not char then HideAll(); return end
+        local HRP      = char:FindFirstChild("HumanoidRootPart")
+        local Humanoid = char:FindFirstChild("Humanoid")
+        if not HRP or not Humanoid then HideAll(); return end
+
+        -- On-screen + distance check
+        local wpos, onScreen = Cam:WorldToScreenPoint(HRP.Position)
+        local dist = (Cam.CFrame.Position - HRP.Position).Magnitude / 3.5714
+        if not onScreen or dist > ESP.MaxDistance then HideAll(); return end
+
+        -- Team-check (hide teammates)
+        if ESP.TeamCheck and lplayer.Team == plr.Team then HideAll(); return end
+
+        -- Scale
+        local sf     = (HRP.Size.Y * Cam.ViewportSize.Y) / (wpos.Z * 2)
+        local bw, bh = 3*sf, 4.5*sf
+        local px, py = wpos.X, wpos.Y
+        local lx, rx = px - bw/2, px + bw/2
+        local ty, by = py - bh/2, py + bh/2
+        local t = tick()
+
+        -- Font (O(1) cache hit every frame)
+        local cf = resolveFont(ESP.Font)
+        local fs = ESP.FontSize
+        Name.Font=cf;       Name.TextSize=fs
+        Distance.Font=cf;   Distance.TextSize=fs
+        WeaponLbl.Font=cf;  WeaponLbl.TextSize=fs
+        HealthText.Font=cf; HealthText.TextSize=fs
+
+        -- Fade on distance
+        if EFO.OnDistance then
+            local op = math.max(0.1, 1 - dist/ESP.MaxDistance)
+            for _,el in ipairs(fadeList) do applyFade(el, op) end
         end
 
-        Connection = Euphoria.RunService.RenderStepped:Connect(function()
-            if not ESP.Enabled then HideESP(); return end
-            if not plr.Character or not plr.Character:FindFirstChild("HumanoidRootPart") then
-                HideESP(); return
+        -- ── CHAMS ─────────────────────────────────────────────
+        -- [FIX] Adornee refreshed every frame so respawns work
+        -- [FIX] Enabled only set true when player is actually visible in this frame
+        local chamsWanted = ECh.Enabled
+        if chamsWanted then
+            Chams.Adornee   = char
+            Chams.Enabled   = true
+            Chams.DepthMode = ECh.VisibleCheck and "Occluded" or "AlwaysOnTop"
+
+            -- ── Color mode (ColorRotate > Rainbow > flat) ────
+            local fillColor
+            if ECh.ColorRotate then
+                -- Sine lerp FillRGB ↔ OutlineRGB
+                local a = (math.sin(t * ECh.ColorRotateSpeed * math.pi * 2) + 1) * 0.5
+                fillColor = lerpC(ECh.FillRGB, ECh.OutlineRGB, a)
+            elseif ECh.Rainbow then
+                fillColor = Color3.fromHSV((t * ECh.RainbowSpeed) % 1, 1, 1)
+            else
+                fillColor = ECh.FillRGB
             end
+            Chams.FillColor    = fillColor
+            Chams.OutlineColor = ECh.OutlineRGB
 
-            local HRP      = plr.Character.HumanoidRootPart
-            local Humanoid = plr.Character:WaitForChild("Humanoid")
-            local Pos, OnScreen = Cam:WorldToScreenPoint(HRP.Position)
-            local Dist = (Cam.CFrame.Position - HRP.Position).Magnitude / 3.5714285714
+            -- ── Thermal pulse (fully independent of color mode) ──
+            -- [FIX] Formula: baseFill * (1 - breathe) so the pulse goes
+            --   baseFill (dim) → 0 (fully visible) → baseFill (dim) — a real "breathe in" sweep
+            --   Previously was baseFill*breathe which went 0→baseFill (barely visible change)
+            local baseFill    = ECh.Fill_Transparency    / 100
+            local baseOutline = ECh.Outline_Transparency / 100
+            if ECh.Thermal then
+                -- breathe 0→1→0 using (1-cos)/2 for smooth symmetric wave
+                local breathe = (1 - math.cos(t * ECh.ThermalSpeed * math.pi * 2)) * 0.5
+                -- transparency: at breathe=0 → baseFill (user's opacity), at breathe=1 → 0 (full glow)
+                Chams.FillTransparency    = baseFill * (1 - breathe)
+                Chams.OutlineTransparency = baseOutline * (1 - breathe)
+            else
+                Chams.FillTransparency    = baseFill
+                Chams.OutlineTransparency = baseOutline
+            end
+        else
+            Chams.Enabled  = false
+            Chams.Adornee  = nil
+        end
 
-            if OnScreen and Dist <= ESP.MaxDistance then
-                local Size = HRP.Size.Y
-                local scaleFactor = (Size * Cam.ViewportSize.Y) / (Pos.Z * 2)
-                local w, h = 3 * scaleFactor, 4.5 * scaleFactor
+        -- ── CORNER BOX ────────────────────────────────────────
+        local cen  = EBx.Corner.Enabled
+        local cRGB = EBx.Corner.RGB
+        local cW, cH = bw/5, bh/5
+        -- LT_H, LT_V
+        C[1].Visible=cen; C[1].BackgroundColor3=cRGB
+        C[1].Position=UDim2.new(0,lx,0,ty);    C[1].Size=UDim2.new(0,cW,0,1)
+        C[2].Visible=cen; C[2].BackgroundColor3=cRGB
+        C[2].Position=UDim2.new(0,lx,0,ty);    C[2].Size=UDim2.new(0,1,0,cH)
+        -- LB_H, LB_V
+        C[3].Visible=cen; C[3].BackgroundColor3=cRGB; C[3].AnchorPoint=Vector2.new(0,1)
+        C[3].Position=UDim2.new(0,lx,0,by);    C[3].Size=UDim2.new(0,cW,0,1)
+        C[4].Visible=cen; C[4].BackgroundColor3=cRGB; C[4].AnchorPoint=Vector2.new(0,1)
+        C[4].Position=UDim2.new(0,lx,0,by);    C[4].Size=UDim2.new(0,1,0,cH)
+        -- RT_H, RT_V
+        C[5].Visible=cen; C[5].BackgroundColor3=cRGB; C[5].AnchorPoint=Vector2.new(1,0)
+        C[5].Position=UDim2.new(0,rx,0,ty);    C[5].Size=UDim2.new(0,cW,0,1)
+        C[6].Visible=cen; C[6].BackgroundColor3=cRGB; C[6].AnchorPoint=Vector2.new(1,0)
+        C[6].Position=UDim2.new(0,rx,0,ty);    C[6].Size=UDim2.new(0,1,0,cH)
+        -- RB_H, RB_V
+        C[7].Visible=cen; C[7].BackgroundColor3=cRGB; C[7].AnchorPoint=Vector2.new(1,1)
+        C[7].Position=UDim2.new(0,rx,0,by);    C[7].Size=UDim2.new(0,cW,0,1)
+        C[8].Visible=cen; C[8].BackgroundColor3=cRGB; C[8].AnchorPoint=Vector2.new(1,1)
+        C[8].Position=UDim2.new(0,rx,0,by);    C[8].Size=UDim2.new(0,1,0,cH)
 
-                if ESP.FadeOut.OnDistance then
-                    for _, el in pairs({Box, Outline, Name, Distance, Weapon,
-                        Healthbar, BehindHealthbar, HealthText, WeaponIcon,
-                        LeftTop, LeftSide, BottomSide, BottomDown,
-                        RightTop, RightSide, BottomRightSide, BottomRightDown, Chams}) do
-                        Functions:FadeOutOnDist(el, Dist)
-                    end
-                end
+        -- ── FULL / FILLED BOX ─────────────────────────────────
+        Box.Position = UDim2.new(0,lx,0,ty)
+        Box.Size     = UDim2.new(0,bw,0,bh)
+        Box.Visible  = EBx.Full.Enabled or EBx.Filled.Enabled
 
-                local passTeam = (ESP.TeamCheck and plr ~= lplayer and
-                    ((lplayer.Team ~= plr.Team and plr.Team) or
-                     (not lplayer.Team and not plr.Team)))
-                    or (not ESP.TeamCheck and plr ~= lplayer)
+        if EBx.GradientFill then
+            Box.BackgroundColor3       = Color3.fromRGB(255,255,255)
+            Box.BackgroundTransparency = EBx.Filled.Enabled and EBx.Filled.Transparency or 1
+        else
+            Box.BackgroundColor3       = EBx.Filled.Enabled and EBx.Filled.RGB or Color3.new(0,0,0)
+            Box.BackgroundTransparency = EBx.Filled.Enabled and EBx.Filled.Transparency or 1
+        end
 
-                if passTeam then
-                    -- ── Font (live update) ──────────────────────────────
-                    local currentFont = Functions:ResolveFont(ESP.Font)
-                    Name.Font       = currentFont
-                    Distance.Font   = currentFont
-                    Weapon.Font     = currentFont
-                    HealthText.Font = currentFont
+        Stroke.Enabled = EBx.Full.Enabled
+        if EBx.Full.Enabled then Stroke.Color = EBx.Full.RGB end
 
-                    Name.TextSize       = ESP.FontSize
-                    Distance.TextSize   = ESP.FontSize
-                    Weapon.TextSize     = ESP.FontSize
-                    HealthText.TextSize = ESP.FontSize
+        -- Fill gradient (dirty check)
+        GradFill.Enabled = EBx.GradientFill
+        if EBx.GradientFill then
+            local g1,g2 = EBx.GradientFillRGB1, EBx.GradientFillRGB2
+            if g1~=pGF1 or g2~=pGF2 then GradFill.Color=cs2(g1,g2); pGF1=g1; pGF2=g2 end
+        end
+        -- Stroke gradient (dirty check)
+        GradStroke.Enabled = EBx.Gradient
+        if EBx.Gradient then
+            local g1,g2 = EBx.GradientRGB1, EBx.GradientRGB2
+            if g1~=pGO1 or g2~=pGO2 then GradStroke.Color=cs2(g1,g2); pGO1=g1; pGO2=g2 end
+        end
+        -- Gradient rotation animation
+        local rot = EBx.Animate and ((t*EBx.RotationSpeed)%360) or 315
+        if rot > 180 then rot = rot - 360 end
+        GradFill.Rotation   = rot
+        GradStroke.Rotation = rot
 
-                    -- ── CHAMS ────────────────────────────────────────────
-                    Chams.Adornee = plr.Character
-                    Chams.Enabled = ESP.Drawing.Chams.Enabled
+        -- ── HEALTHBAR ──────────────────────────────────────────
+        local maxHP = Humanoid.MaxHealth
+        local hp    = maxHP > 0 and math.clamp(Humanoid.Health/maxHP, 0, 1) or 0
+        if EHb.Enabled then
+            local barW   = EHb.Width
+            local barH   = bh * hp
+            local barX   = lx - barW - 3
 
-                    -- [NEW] Color rotation animation: lerp FillRGB ↔ OutlineRGB via sine wave
-                    if ESP.Drawing.Chams.Enabled and ESP.Drawing.Chams.ColorRotate then
-                        local alpha = (math.sin(tick() * ESP.Drawing.Chams.ColorRotateSpeed) + 1) / 2
-                        Chams.FillColor = Functions:LerpColor(
-                            ESP.Drawing.Chams.FillRGB,
-                            ESP.Drawing.Chams.OutlineRGB,
-                            alpha
-                        )
-                    else
-                        Chams.FillColor = ESP.Drawing.Chams.FillRGB
-                    end
-                    Chams.OutlineColor = ESP.Drawing.Chams.OutlineRGB
+            -- Track (full height, always visible behind fill)
+            HBTrack.Visible  = true
+            HBTrack.Position = UDim2.new(0,barX,0,ty)
+            HBTrack.Size     = UDim2.new(0,barW,0,bh)
 
-                    if ESP.Drawing.Chams.Thermal then
-                        local breathe = math.atan(math.sin(tick() * 2)) * 2 / math.pi
-                        Chams.FillTransparency    = (ESP.Drawing.Chams.Fill_Transparency / 100)    * breathe * 0.01 + (ESP.Drawing.Chams.Fill_Transparency / 100)
-                        Chams.OutlineTransparency = (ESP.Drawing.Chams.Outline_Transparency / 100) * breathe * 0.01 + (ESP.Drawing.Chams.Outline_Transparency / 100)
-                    else
-                        Chams.FillTransparency    = ESP.Drawing.Chams.Fill_Transparency    / 100
-                        Chams.OutlineTransparency = ESP.Drawing.Chams.Outline_Transparency / 100
-                    end
-                    Chams.DepthMode = ESP.Drawing.Chams.VisibleCheck and "Occluded" or "AlwaysOnTop"
+            -- Fill (grows UPWARD from bottom because AnchorPoint.Y=1)
+            HBFill.Visible   = true
+            HBFill.Position  = UDim2.new(0,barX,0,by)   -- pinned to bottom edge
+            HBFill.Size      = UDim2.new(0,barW,0,barH)
 
-                    -- ── CORNER BOXES ─────────────────────────────────────
-                    for _, c in pairs({LeftTop, LeftSide, BottomSide, BottomDown, RightTop, RightSide, BottomRightSide, BottomRightDown}) do
-                        c.BackgroundColor3 = ESP.Drawing.Boxes.Corner.RGB
-                        c.Visible          = ESP.Drawing.Boxes.Corner.Enabled
-                    end
-                    LeftTop.Position         = UDim2.new(0, Pos.X - w/2,     0, Pos.Y - h/2)
-                    LeftTop.Size             = UDim2.new(0, w/5, 0, 1)
-                    LeftSide.Position        = UDim2.new(0, Pos.X - w/2,     0, Pos.Y - h/2)
-                    LeftSide.Size            = UDim2.new(0, 1,   0, h/5)
-                    BottomSide.Position      = UDim2.new(0, Pos.X - w/2,     0, Pos.Y + h/2)
-                    BottomSide.Size          = UDim2.new(0, 1,   0, h/5)
-                    BottomSide.AnchorPoint   = Vector2.new(0, 5)
-                    BottomDown.Position      = UDim2.new(0, Pos.X - w/2,     0, Pos.Y + h/2)
-                    BottomDown.Size          = UDim2.new(0, w/5, 0, 1)
-                    BottomDown.AnchorPoint   = Vector2.new(0, 1)
-                    RightTop.Position        = UDim2.new(0, Pos.X + w/2,     0, Pos.Y - h/2)
-                    RightTop.Size            = UDim2.new(0, w/5, 0, 1)
-                    RightTop.AnchorPoint     = Vector2.new(1, 0)
-                    RightSide.Position       = UDim2.new(0, Pos.X + w/2 - 1, 0, Pos.Y - h/2)
-                    RightSide.Size           = UDim2.new(0, 1,   0, h/5)
-                    RightSide.AnchorPoint    = Vector2.new(0, 0)
-                    BottomRightSide.Position = UDim2.new(0, Pos.X + w/2,     0, Pos.Y + h/2)
-                    BottomRightSide.Size     = UDim2.new(0, 1,   0, h/5)
-                    BottomRightSide.AnchorPoint = Vector2.new(1, 1)
-                    BottomRightDown.Position = UDim2.new(0, Pos.X + w/2,     0, Pos.Y + h/2)
-                    BottomRightDown.Size     = UDim2.new(0, w/5, 0, 1)
-                    BottomRightDown.AnchorPoint = Vector2.new(1, 1)
-
-                    -- ── FULL / FILLED BOX ────────────────────────────────
-                    Box.Position = UDim2.new(0, Pos.X - w/2, 0, Pos.Y - h/2)
-                    Box.Size     = UDim2.new(0, w, 0, h)
-                    Box.Visible  = ESP.Drawing.Boxes.Full.Enabled or ESP.Drawing.Boxes.Filled.Enabled
-
-                    if ESP.Drawing.Boxes.GradientFill then
-                        Box.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-                    else
-                        Box.BackgroundColor3 = ESP.Drawing.Boxes.Filled.Enabled
-                            and ESP.Drawing.Boxes.Filled.RGB or Color3.fromRGB(0, 0, 0)
-                    end
-                    Box.BackgroundTransparency = ESP.Drawing.Boxes.Filled.Enabled
-                        and ESP.Drawing.Boxes.Filled.Transparency or 1
-                    Box.BorderSizePixel = ESP.Drawing.Boxes.Filled.Enabled and 1 or 0
-
-                    -- Outline stroke (Full Box)
-                    Outline.Enabled = ESP.Drawing.Boxes.Full.Enabled
-                    Outline.Color   = ESP.Drawing.Boxes.Full.RGB
-
-                    -- Fill gradient
-                    Gradient1.Enabled = ESP.Drawing.Boxes.GradientFill
-                    if ESP.Drawing.Boxes.GradientFill then
-                        Gradient1.Color = ColorSequence.new{
-                            ColorSequenceKeypoint.new(0, ESP.Drawing.Boxes.GradientFillRGB1),
-                            ColorSequenceKeypoint.new(1, ESP.Drawing.Boxes.GradientFillRGB2)
-                        }
-                    end
-
-                    -- Outline gradient
-                    Gradient2.Enabled = ESP.Drawing.Boxes.Gradient
-                    if ESP.Drawing.Boxes.Gradient then
-                        Gradient2.Color = ColorSequence.new{
-                            ColorSequenceKeypoint.new(0, ESP.Drawing.Boxes.GradientRGB1),
-                            ColorSequenceKeypoint.new(1, ESP.Drawing.Boxes.GradientRGB2)
-                        }
-                    end
-
-                    -- Rotation animation for gradients
-                    local rawRot = ESP.Drawing.Boxes.Animate
-                        and ((tick() * ESP.Drawing.Boxes.RotationSpeed) % 360) or 315
-                    if rawRot > 180 then rawRot = rawRot - 360 end
-                    Gradient1.Rotation = rawRot
-                    Gradient2.Rotation = rawRot
-
-                    -- ── HEALTHBAR ────────────────────────────────────────
-                    -- [FIX] Bar bottom is pinned to bottom of player bbox.
-                    --       As health rises, the bar grows UPWARD (AnchorPoint.Y=1).
-                    local health = math.clamp(Humanoid.Health / Humanoid.MaxHealth, 0, 1)
-                    if ESP.Drawing.Healthbar.Enabled then
-                        local barH   = h * health
-                        local barX   = Pos.X - w/2 - 6
-                        local barBot = Pos.Y + h/2   -- bottom edge of player box
-
-                        -- Background (full height, dark grey)
-                        BehindHealthbar.Visible  = true
-                        BehindHealthbar.Position = UDim2.new(0, barX, 0, barBot - h)
-                        BehindHealthbar.Size     = UDim2.new(0, ESP.Drawing.Healthbar.Width, 0, h)
-
-                        -- Foreground bar (grows upward from bottom)
-                        Healthbar.Visible   = true
-                        Healthbar.Position  = UDim2.new(0, barX, 0, barBot)   -- pinned to bottom
-                        Healthbar.Size      = UDim2.new(0, ESP.Drawing.Healthbar.Width, 0, barH)
-                        -- AnchorPoint.Y = 1 means the frame extends upward from Position
-
-                        if ESP.Drawing.Healthbar.Gradient then
-                            Healthbar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-                            HealthbarGradient.Enabled  = true
-                            -- [FIX] Gradient rotation -90: keypoint 0 = top of bar = high HP color
-                            HealthbarGradient.Rotation = -90
-                            HealthbarGradient.Color = ColorSequence.new{
-                                ColorSequenceKeypoint.new(0,   ESP.Drawing.Healthbar.GradientRGB1),
-                                ColorSequenceKeypoint.new(0.5, ESP.Drawing.Healthbar.GradientRGB2),
-                                ColorSequenceKeypoint.new(1,   ESP.Drawing.Healthbar.GradientRGB3)
-                            }
-                        else
-                            HealthbarGradient.Enabled    = false
-                            Healthbar.BackgroundColor3   = ESP.Drawing.Healthbar.RGB
-                        end
-
-                        if ESP.Drawing.Healthbar.HealthText then
-                            local hp = math.floor(health * 100)
-                            -- Text sits just above the top of the health bar
-                            HealthText.Position = UDim2.new(0, barX - 6, 0, barBot - barH - 2)
-                            HealthText.Text     = tostring(hp)
-                            HealthText.Visible  = Humanoid.Health < Humanoid.MaxHealth
-                            HealthText.TextColor3 = ESP.Drawing.Healthbar.Lerp
-                                and (health >= 0.75 and Color3.fromRGB(0,255,0)
-                                    or health >= 0.5 and Color3.fromRGB(255,255,0)
-                                    or health >= 0.25 and Color3.fromRGB(255,170,0)
-                                    or Color3.fromRGB(255,0,0))
-                                or ESP.Drawing.Healthbar.HealthTextRGB
-                        else
-                            HealthText.Visible = false
-                        end
-                    else
-                        Healthbar.Visible        = false
-                        BehindHealthbar.Visible  = false
-                        HealthText.Visible       = false
-                    end
-
-                    -- ── NAMES ────────────────────────────────────────────
-                    -- [FIX] Name color now always reads from ESP.Drawing.Names.RGB
-                    --       Team/Friend overrides only change color, not RGB config.
-                    Name.Position = UDim2.new(0, Pos.X, 0, Pos.Y - h/2 - 9)
-                    if ESP.Drawing.Names.Enabled then
-                        if ESP.Options.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
-                            Name.TextColor3 = ESP.Options.FriendcheckRGB
-                            Name.Text = string.format(
-                                '(<font color="rgb(%d,%d,%d)">F</font>) %s',
-                                ESP.Options.FriendcheckRGB.R * 255,
-                                ESP.Options.FriendcheckRGB.G * 255,
-                                ESP.Options.FriendcheckRGB.B * 255,
-                                plr.Name
-                            )
-                        elseif ESP.Options.Teamcheck then
-                            Name.TextColor3 = ESP.Options.TeamcheckRGB
-                            Name.Text       = plr.Name
-                        else
-                            Name.TextColor3 = ESP.Drawing.Names.RGB   -- [FIX] was being ignored
-                            Name.Text       = plr.Name
-                        end
-                        Name.Visible = true
-                    else
-                        Name.Visible = false
-                    end
-
-                    -- ── DISTANCES ────────────────────────────────────────
-                    if ESP.Drawing.Distances.Enabled then
-                        Distance.TextColor3 = ESP.Drawing.Distances.RGB
-                        if ESP.Drawing.Distances.Position == "Bottom" then
-                            Weapon.Position   = UDim2.new(0, Pos.X, 0, Pos.Y + h/2 + 18)
-                            WeaponIcon.Position = UDim2.new(0, Pos.X - 21, 0, Pos.Y + h/2 + 15)
-                            Distance.Position = UDim2.new(0, Pos.X, 0, Pos.Y + h/2 + 7)
-                            Distance.Text     = string.format("%d meters", math.floor(Dist))
-                            Distance.Visible  = true
-                            if ESP.Drawing.Names.Enabled then
-                                if ESP.Options.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
-                                    Name.Text = string.format(
-                                        '(<font color="rgb(%d,%d,%d)">F</font>) %s',
-                                        ESP.Options.FriendcheckRGB.R*255,
-                                        ESP.Options.FriendcheckRGB.G*255,
-                                        ESP.Options.FriendcheckRGB.B*255,
-                                        plr.Name
-                                    )
-                                else
-                                    Name.Text = plr.Name
-                                end
-                            end
-                        elseif ESP.Drawing.Distances.Position == "Text" then
-                            Weapon.Position   = UDim2.new(0, Pos.X, 0, Pos.Y + h/2 + 8)
-                            WeaponIcon.Position = UDim2.new(0, Pos.X - 21, 0, Pos.Y + h/2 + 5)
-                            Distance.Visible  = false
-                            if ESP.Drawing.Names.Enabled then
-                                if ESP.Options.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
-                                    Name.Text = string.format(
-                                        '(<font color="rgb(%d,%d,%d)">F</font>) %s [%d]',
-                                        ESP.Options.FriendcheckRGB.R*255,
-                                        ESP.Options.FriendcheckRGB.G*255,
-                                        ESP.Options.FriendcheckRGB.B*255,
-                                        plr.Name, math.floor(Dist)
-                                    )
-                                elseif ESP.Options.Teamcheck then
-                                    Name.Text = string.format('%s [%d]', plr.Name, math.floor(Dist))
-                                else
-                                    Name.Text = string.format('%s [%d]', plr.Name, math.floor(Dist))
-                                end
-                            end
-                        end
-                    else
-                        Distance.Visible    = false
-                        Weapon.Position     = UDim2.new(0, Pos.X, 0, Pos.Y + h/2 + 8)
-                        WeaponIcon.Position = UDim2.new(0, Pos.X - 21, 0, Pos.Y + h/2 + 5)
-                    end
-
-                    -- ── WEAPONS ──────────────────────────────────────────
-                    if ESP.Drawing.Weapons.Enabled then
-                        Weapon.Text       = "none"
-                        Weapon.TextColor3 = ESP.Drawing.Weapons.WeaponTextRGB
-                        Weapon.Visible    = true
-                        WeaponIcon.Visible = true
-                        Gradient3.Enabled = ESP.Drawing.Weapons.Gradient
-                        if ESP.Drawing.Weapons.Gradient then
-                            Gradient3.Color = ColorSequence.new{
-                                ColorSequenceKeypoint.new(0, ESP.Drawing.Weapons.GradientRGB1),
-                                ColorSequenceKeypoint.new(1, ESP.Drawing.Weapons.GradientRGB2)
-                            }
-                        end
-                    else
-                        Weapon.Visible    = false
-                        WeaponIcon.Visible = false
-                    end
-
-                else
-                    HideESP()
+            if EHb.Gradient then
+                HBFill.BackgroundColor3 = Color3.fromRGB(255,255,255)
+                HBGrad.Enabled = true
+                local g1,g2,g3 = EHb.GradientRGB1, EHb.GradientRGB2, EHb.GradientRGB3
+                if g1~=pHG1 or g2~=pHG2 or g3~=pHG3 then
+                    HBGrad.Color=cs3(g1,g2,g3); pHG1=g1; pHG2=g2; pHG3=g3
                 end
             else
-                HideESP()
+                HBGrad.Enabled         = false
+                HBFill.BackgroundColor3 = EHb.RGB
             end
-        end)
-    end
-    coroutine.wrap(Updater)()
+
+            if EHb.HealthText then
+                HealthText.Visible   = true
+                HealthText.Text      = tostring(math.floor(hp*100))
+                HealthText.Position  = UDim2.new(0, barX-2, 0, by-barH-8)
+                if EHb.Lerp then
+                    HealthText.TextColor3 = hp>=0.75 and Color3.fromRGB(0,255,0)
+                        or hp>=0.5 and Color3.fromRGB(255,255,0)
+                        or hp>=0.25 and Color3.fromRGB(255,170,0)
+                        or Color3.fromRGB(255,0,0)
+                else
+                    HealthText.TextColor3 = EHb.HealthTextRGB
+                end
+            else
+                HealthText.Visible = false
+            end
+        else
+            HBFill.Visible=false; HBTrack.Visible=false; HealthText.Visible=false
+        end
+
+        -- ── NAMES ──────────────────────────────────────────────
+        -- [FIX] Team color: read plr.Team.TeamColor.Color (real Roblox team color)
+        --       TeamColorOverride: use custom TeamcheckRGB color instead
+        Name.Position = UDim2.new(0, px, 0, ty-11)
+        if ENm.Enabled then
+            local nameColor
+            if ENm.Rainbow then
+                nameColor = Color3.fromHSV((t*ENm.RainbowSpeed)%1, 1, 1)
+            elseif EOp.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
+                nameColor = EOp.FriendcheckRGB
+            elseif EOp.TeamColor then
+                -- [FIX] actual team color from Roblox team object
+                if EOp.TeamColorOverride then
+                    nameColor = EOp.TeamcheckRGB
+                else
+                    nameColor = getTeamColor(plr) or ENm.RGB
+                end
+            else
+                nameColor = ENm.RGB
+            end
+            Name.TextColor3 = nameColor
+
+            if EOp.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
+                local fc = EOp.FriendcheckRGB
+                Name.Text = string.format(
+                    '(<font color="rgb(%d,%d,%d)">F</font>) %s',
+                    fc.R*255, fc.G*255, fc.B*255, plr.Name)
+            else
+                Name.Text = plr.Name
+            end
+            Name.Visible = true
+        else
+            Name.Visible = false
+        end
+
+        -- ── DISTANCES ──────────────────────────────────────────
+        local wOffY, wiOffY
+        if EDi.Enabled then
+            Distance.TextColor3 = EDi.RGB
+            if EDi.Position == "Bottom" then
+                Distance.Position = UDim2.new(0,px,0,by+7)
+                Distance.Text     = math.floor(dist).."m"
+                Distance.Visible  = true
+                wOffY=by+18; wiOffY=by+15
+            else  -- "Text": append [dist] to name label
+                Distance.Visible = false
+                wOffY=by+8; wiOffY=by+5
+                if ENm.Enabled then
+                    if EOp.Friendcheck and lplayer:IsFriendsWith(plr.UserId) then
+                        local fc=EOp.FriendcheckRGB
+                        Name.Text=string.format('(<font color="rgb(%d,%d,%d)">F</font>) %s [%dm]',
+                            fc.R*255,fc.G*255,fc.B*255, plr.Name, math.floor(dist))
+                    else
+                        Name.Text=string.format("%s [%dm]", plr.Name, math.floor(dist))
+                    end
+                end
+            end
+        else
+            Distance.Visible=false; wOffY=by+8; wiOffY=by+5
+        end
+
+        -- ── WEAPONS ────────────────────────────────────────────
+        if EWp.Enabled then
+            WeaponLbl.Text       = "none"
+            WeaponLbl.TextColor3 = EWp.WeaponTextRGB
+            WeaponLbl.Position   = UDim2.new(0,px,0,wOffY)
+            WeaponLbl.Visible    = true
+            if EWp.Gradient then
+                local g1,g2 = EWp.GradientRGB1, EWp.GradientRGB2
+                if g1~=pWG1 or g2~=pWG2 then pWG1=g1; pWG2=g2 end
+            end
+        else
+            WeaponLbl.Visible = false
+        end
+
+        -- ── SNAPLINE ───────────────────────────────────────────
+        if ESL.Enabled then
+            local vp      = Cam.ViewportSize
+            local ox, oy  = vp.X*0.5, vp.Y
+            local dx, dy  = px-ox, by-oy
+            local len     = math.sqrt(dx*dx+dy*dy)
+            local angle   = math.deg(math.atan2(dx, -dy))
+            Snap.BackgroundColor3 = ESL.RGB
+            Snap.Position  = UDim2.new(0,ox,0,oy)
+            Snap.Size      = UDim2.new(0,1,0,len)
+            Snap.Rotation  = angle
+            Snap.Visible   = true
+        else
+            Snap.Visible = false
+        end
+    end)
 end
 
--- ============================================================
---  SPAWN ESP FOR ALL CURRENT + FUTURE PLAYERS
--- ============================================================
+-- ────────────────────────────────────────────────────────────
+--  BOOTSTRAP
+-- ────────────────────────────────────────────────────────────
 for _, v in pairs(Players:GetPlayers()) do
-    if v ~= lplayer then coroutine.wrap(ESP_func)(v) end
+    if v ~= lplayer then task.spawn(ESP_func, v) end
 end
-Players.PlayerAdded:Connect(function(v)
-    coroutine.wrap(ESP_func)(v)
-end)
+Players.PlayerAdded:Connect(function(v) task.spawn(ESP_func, v) end)
 
 return API
